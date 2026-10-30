@@ -6,7 +6,7 @@ from pathlib import Path
 
 import modal
 
-from .modal_app import cache, image, model_id, secret_name
+from .modal_app import backend, backend_options, cache, image, model_id, secret_name
 
 app = modal.App("jev-inference-benchmark")
 
@@ -22,7 +22,7 @@ def evaluate(cases: list[dict], repeats: int, model: str, dtype: str = "auto"):
     from jev_inference.benchmark import run_benchmark
     from jev_inference.engine import DecisionEngine
 
-    engine = DecisionEngine(model, device="cuda", dtype=dtype)
+    engine = DecisionEngine(model, device="cuda", dtype=dtype, backend=backend, **backend_options())
     cache.commit()
     return run_benchmark(engine, cases, repeats)
 

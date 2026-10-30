@@ -11,6 +11,10 @@ START = "<!-- benchmark-results:start -->"
 END = "<!-- benchmark-results:end -->"
 
 
+def number(value, digits=1):
+    return "N/A" if value is None else f"{value:.{digits}f}"
+
+
 def summary_table(result: dict) -> str:
     lines = [
         "| Method | Correct | Invalid | Median ms | p95 ms | Peak VRAM MiB | Extra MiB |",
@@ -22,7 +26,7 @@ def summary_table(result: dict) -> str:
             f"| `{method}` | {item['correct']}/{item['total']} "
             f"({item['accuracy']:.1%}) | {item['invalid_outputs']} | "
             f"{item['latency_ms_median']:.1f} | {item['latency_ms_p95']:.1f} | "
-            f"{item['max_peak_allocated_mib']:.1f} | {item['max_extra_peak_mib']:.1f} |"
+            f"{number(item['max_peak_allocated_mib'])} | {number(item['max_extra_peak_mib'])} |"
         )
     return "\n".join(lines)
 
@@ -85,10 +89,13 @@ def snippet(
     label_ratio = (
         summary["generate_label"]["latency_ms_median"] / summary["labels"]["latency_ms_median"]
     )
+    label_memory = summary["labels"]["max_peak_allocated_mib"]
+    generation_memory = summary["generate_label"]["max_peak_allocated_mib"]
     memory_direction = (
-        "more"
-        if summary["labels"]["max_peak_allocated_mib"]
-        > summary["generate_label"]["max_peak_allocated_mib"]
+        "unknown"
+        if label_memory is None or generation_memory is None
+        else "more"
+        if label_memory > generation_memory
         else "no more"
     )
     p95_direction = (
@@ -209,8 +216,8 @@ def full_report(result: dict, results_name: str = "benchmark-results.json") -> s
         lines.append(
             f"| {row['id']} | {row['method']} | {row['expected']} | "
             f"{row['choice'] or 'INVALID'} | {'✓' if row['correct'] else '✗'} | "
-            f"{row['latency_ms_median']:.1f} | {row['peak_allocated_mib']:.1f} | "
-            f"{row['extra_peak_mib']:.1f} | {row['stable_choice']} |"
+            f"{row['latency_ms_median']:.1f} | {number(row['peak_allocated_mib'])} | "
+            f"{number(row['extra_peak_mib'])} | {row['stable_choice']} |"
         )
     lines.extend(
         [
@@ -359,7 +366,7 @@ def comparison_snippet(results: list[dict], paths: list[Path]) -> str:
                 f"| {model} | `{method}` | {item['correct']}/{item['total']} "
                 f"({item['accuracy']:.1%}) | {item['invalid_outputs']} | "
                 f"{item['latency_ms_median']:.1f} | {item['latency_ms_p95']:.1f} | "
-                f"{item['max_peak_allocated_mib']:.1f} |"
+                f"{number(item['max_peak_allocated_mib'])} |"
             )
     lines.extend(test_rig(results[0]))
     if meta["gpu"] == "Tesla T4" and meta["dtype"] == "torch.bfloat16":

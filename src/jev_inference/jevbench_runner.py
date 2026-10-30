@@ -13,7 +13,7 @@ from ._vendor.jevbench.metrics import brier_score, ece_top_label, ordinal_mae, p
 from ._vendor.jevbench.scoring import score_label, score_task
 from ._vendor.jevbench.tasks import Task, dataset_hash
 from .benchmark import METHODS as ORIGINAL_METHODS
-from .benchmark import generate_choice, run_choice
+from .benchmark import generate_choice, max_optional, run_choice
 from .jevbench_data import case_for, orders_for
 
 METHODS = (*ORIGINAL_METHODS, "sequence_likelihood")
@@ -94,8 +94,8 @@ def aggregate(rows: list[dict], tasks: dict[str, Task]) -> dict:
         ),
         "latency_ms_median": percentile(times, 0.5),
         "latency_ms_p95": percentile(times, 0.95),
-        "max_peak_allocated_mib": max(row["peak_allocated_mib"] for row in rows),
-        "max_extra_peak_mib": max(row["extra_peak_mib"] for row in rows),
+        "max_peak_allocated_mib": max_optional([row["peak_allocated_mib"] for row in rows]),
+        "max_extra_peak_mib": max_optional([row["extra_peak_mib"] for row in rows]),
         "calibration_n": len(probability_rows),
         "brier_mean": (
             sum(
@@ -236,8 +236,7 @@ def run_jevbench(
 ) -> dict:
     if repeats < 1 or permutations < 0:
         raise ValueError("repeats must be positive and permutations nonnegative")
-    device = engine.model.device
-    if device.type != "cuda" or {p.device for p in engine.model.parameters()} != {device}:
+    if not engine.backend.is_cuda:
         raise ValueError("benchmark requires a model entirely on one CUDA GPU")
     tasks = [Task.from_dict(record["task"]) for record in records]
     warm = case_for(tasks[0], tasks[0].labels)
@@ -265,8 +264,10 @@ def run_jevbench(
                     "choice": first.get("choice"),
                     "outcome": outcome_for(first, task),
                     "latency_ms_median": percentile([run["latency_ms"] for run in measured], 0.5),
-                    "peak_allocated_mib": max(run["peak_allocated_mib"] for run in measured),
-                    "extra_peak_mib": max(run["extra_peak_mib"] for run in measured),
+                    "peak_allocated_mib": max_optional(
+                        [run["peak_allocated_mib"] for run in measured]
+                    ),
+                    "extra_peak_mib": max_optional([run["extra_peak_mib"] for run in measured]),
                     "runs": measured,
                 }
                 if first.get("error"):
@@ -275,21 +276,26 @@ def run_jevbench(
         print(f"[{index + 1}/{len(tasks)}] {task.id}", flush=True)
         if checkpoint and (index + 1) % 10 == 0:
             checkpoint(rows)
-    props = engine.torch.cuda.get_device_properties(device)
+    props = engine.device_properties()
+    runtime = engine.runtime_metadata()
+    root = Path(__file__).parent
     fingerprint = {
-        name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
         for name in (
             "engine.py",
             "benchmark.py",
             "jevbench_runner.py",
             "jevbench_data.py",
             "prompts.py",
+            "backends/base.py",
+            "backends/transformers_backend.py",
+            "backends/llamacpp_backend.py",
         )
     }
     metadata = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "model": engine.model_id,
-        "model_revision": getattr(engine.model.config, "_commit_hash", None),
+        "model_revision": runtime.get("model_revision"),
         "dataset_sha256": dataset_hash(tasks),
         "source": source,
         "source_sha256": fingerprint,
@@ -299,13 +305,22 @@ def run_jevbench(
         "repeats": repeats,
         "permutations": permutations,
         "host": host_config(),
-        "gpu_compute_capability": [props.major, props.minor],
-        "gpu": props.name,
-        "gpu_total_mib": props.total_memory / 2**20,
-        "dtype": str(engine.model.dtype),
+        "gpu_compute_capability": props.get("compute_capability"),
+        "gpu": props.get("name"),
+        "gpu_total_mib": (
+            None if props.get("total_memory") is None else props["total_memory"] / 2**20
+        ),
+        "dtype": runtime.get("dtype"),
+        "backend": runtime.get("backend"),
+        "backend_version": runtime.get("backend_version"),
+        "quantization": runtime.get("quantization"),
+        "runtime": runtime,
+        "memory_measurement": (
+            "torch_cuda_allocator" if runtime.get("backend") == "transformers" else "unavailable"
+        ),
         "python": platform.python_version(),
         "versions": {name: version(name) for name in ("torch", "transformers", "accelerate")},
-        "cuda": engine.torch.version.cuda,
+        "cuda": runtime.get("cuda"),
         "max_input_tokens": engine.max_input_tokens,
         "warmup_runs_per_method": 2,
         "batch_size": 1,
@@ -315,7 +330,7 @@ def run_jevbench(
         "temperature": 1.0,
         "scorer": "vendored JevBench v1.2 core; argmax label accuracy; ordinal EV MAE; "
         "supplementary v1.5-style Noul thresholds; no official composite",
-        "timing": "tokenization + model + processing; CUDA synchronized; no HTTP or cold start",
+        "timing": "tokenization + model + processing; GPU synchronized; no HTTP or cold start",
         "calibration": "Brier multiclass sum; top-label ECE, 10 equal-width bins; "
         "only valid distributions on canonical presentations; label-only=N/A",
         "permutation": "one-position cyclic rotation by default; same canonical labels and rubrics",

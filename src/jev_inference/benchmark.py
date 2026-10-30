@@ -67,35 +67,22 @@ def json_prompt(context: str, choices: list[str]) -> str:
 
 
 def generate_choice(engine, case: dict, method: str) -> dict:
-    from transformers import GenerationConfig
-
     prompt = (
         label_prompt(case["context"], case["choices"])
         if method == "generate_label"
         else json_prompt(case["context"], case["choices"])
     )
-    inputs = engine._inputs(prompt)
     limit = 16 if method == "generate_label" else 64
-    eos = engine.model.generation_config.eos_token_id
-    config = GenerationConfig(
-        do_sample=False,
-        num_beams=1,
-        max_new_tokens=limit,
-        use_cache=True,
-        eos_token_id=eos,
-        pad_token_id=engine.tokenizer.pad_token_id,
+    input_tokens = len(
+        engine.backend.encode(engine.backend.format_prompt(prompt), add_special_tokens=False)
     )
-    with engine.torch.inference_mode():
-        output = engine.model.generate(**inputs, generation_config=config)
-    tokens = output[0, inputs["input_ids"].shape[1] :].tolist()
-    text = engine.tokenizer.decode(tokens, skip_special_tokens=True)
-    eos_ids = eos if isinstance(eos, list) else [eos]
+    text, generated_tokens, hit_token_limit = engine.generate(prompt, limit)
     return {
         "choice": parse_generation(text, case["choices"], method),
         "raw_output": text,
-        "generated_tokens": len(tokens),
-        "hit_token_limit": len(tokens) >= limit and tokens[-1] not in eos_ids,
-        "input_tokens": inputs["input_ids"].shape[1],
+        "generated_tokens": generated_tokens,
+        "hit_token_limit": hit_token_limit,
+        "input_tokens": input_tokens,
     }
 
 
@@ -118,31 +105,98 @@ def measure(engine, case: dict, method: str) -> dict:
     return measure_operation(engine, lambda: run_choice(engine, case, method))
 
 
-def measure_operation(engine, operation, capture_errors: bool = False) -> dict:
-    cuda = engine.torch.cuda
+def _mib(value: float | None) -> float | None:
+    return None if value is None else value / 2**20
+
+
+def _torch(engine):
+    return getattr(getattr(engine, "backend", None), "torch", None) or getattr(
+        engine, "torch", None
+    )
+
+
+def _oom_errors(engine) -> tuple[type[BaseException], ...]:
+    errors: tuple[type[BaseException], ...] = (ValueError, MemoryError)
+    torch = _torch(engine)
+    if torch is not None:
+        errors += (torch.OutOfMemoryError,)
+    return errors
+
+
+def _synchronize(engine) -> None:
+    method = getattr(engine, "synchronize", None)
+    if method is not None:
+        method()
+        return
+    engine.torch.cuda.synchronize(engine.model.device)
+
+
+def _memory(engine, name: str) -> float | None:
+    method = getattr(engine, name, None)
+    if method is not None:
+        return method()
+    return getattr(engine.torch.cuda, name)(engine.model.device)
+
+
+def _reset_peak(engine) -> None:
+    method = getattr(engine, "reset_peak_memory", None)
+    if method is not None:
+        method()
+        return
+    engine.torch.cuda.reset_peak_memory_stats(engine.model.device)
+
+
+def _is_cuda(engine) -> bool:
+    backend = getattr(engine, "backend", None)
+    if backend is not None:
+        return bool(backend.is_cuda)
     device = engine.model.device
+    return device.type == "cuda" and {
+        parameter.device for parameter in engine.model.parameters()
+    } == {device}
+
+
+def _device_properties(engine) -> dict:
+    method = getattr(engine, "device_properties", None)
+    if method is not None:
+        return method()
+    properties = engine.torch.cuda.get_device_properties(engine.model.device)
+    return {
+        "name": properties.name,
+        "total_memory": properties.total_memory,
+        "compute_capability": [properties.major, properties.minor],
+    }
+
+
+def measure_operation(engine, operation, capture_errors: bool = False) -> dict:
     gc.collect()
-    cuda.synchronize(device)
-    baseline = cuda.memory_allocated(device)
-    cuda.reset_peak_memory_stats(device)
+    _synchronize(engine)
+    baseline = _memory(engine, "memory_allocated")
+    _reset_peak(engine)
     started = perf_counter()
     try:
         result = operation()
-    except (ValueError, engine.torch.OutOfMemoryError) as error:
+    except _oom_errors(engine) as error:
         if not capture_errors:
             raise
         result = {"choice": None, "error": f"{type(error).__name__}: {error}"}
-    cuda.synchronize(device)
+    _synchronize(engine)
     elapsed_ms = (perf_counter() - started) * 1000
-    peak = cuda.max_memory_allocated(device)
+    peak = _memory(engine, "max_memory_allocated")
+    extra = None if peak is None or baseline is None else peak - baseline
     return {
         **result,
         "latency_ms": elapsed_ms,
-        "baseline_allocated_mib": baseline / 2**20,
-        "peak_allocated_mib": peak / 2**20,
-        "extra_peak_mib": (peak - baseline) / 2**20,
-        "peak_reserved_mib": cuda.max_memory_reserved(device) / 2**20,
+        "baseline_allocated_mib": _mib(baseline),
+        "peak_allocated_mib": _mib(peak),
+        "extra_peak_mib": _mib(extra),
+        "peak_reserved_mib": _mib(_memory(engine, "max_memory_reserved")),
     }
+
+
+def max_optional(values: list[float | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    return max(present) if present else None
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -162,8 +216,8 @@ def summarize(rows: list[dict]) -> dict:
             ),
             "latency_ms_median": statistics.median(times),
             "latency_ms_p95": times[math.ceil(0.95 * count) - 1],
-            "max_peak_allocated_mib": max(row["peak_allocated_mib"] for row in selected),
-            "max_extra_peak_mib": max(row["extra_peak_mib"] for row in selected),
+            "max_peak_allocated_mib": max_optional([row["peak_allocated_mib"] for row in selected]),
+            "max_extra_peak_mib": max_optional([row["extra_peak_mib"] for row in selected]),
         }
     return summary
 
@@ -172,13 +226,12 @@ def run_benchmark(engine, cases: list[dict], repeats: int = 3) -> dict:
     cases = validate_cases(cases)
     if repeats < 1:
         raise ValueError("repeats must be positive")
-    device = engine.model.device
-    if device.type != "cuda" or {p.device for p in engine.model.parameters()} != {device}:
+    if not _is_cuda(engine):
         raise ValueError("benchmark requires a model entirely on one CUDA GPU")
     for method in METHODS:
         for _ in range(2):
             run_choice(engine, cases[0], method)
-    engine.torch.cuda.synchronize(device)
+    _synchronize(engine)
     rows = []
     for case_index, case in enumerate(cases):
         runs = {method: [] for method in METHODS}
@@ -202,30 +255,44 @@ def run_benchmark(engine, cases: list[dict], repeats: int = 3) -> dict:
                     "latency_ms_median": statistics.median(
                         run["latency_ms"] for run in measurements
                     ),
-                    "peak_allocated_mib": max(run["peak_allocated_mib"] for run in measurements),
-                    "extra_peak_mib": max(run["extra_peak_mib"] for run in measurements),
+                    "peak_allocated_mib": max_optional(
+                        [run["peak_allocated_mib"] for run in measurements]
+                    ),
+                    "extra_peak_mib": max_optional([run["extra_peak_mib"] for run in measurements]),
                     "runs": measurements,
                 }
             )
         print(f"[{case_index + 1}/{len(cases)}] {case['id']}", flush=True)
-    properties = engine.torch.cuda.get_device_properties(device)
+    properties = _device_properties(engine)
+    runtime_method = getattr(engine, "runtime_metadata", None)
+    runtime = runtime_method() if runtime_method is not None else {}
+    total_memory = properties.get("total_memory")
     return {
         "metadata": {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "model": engine.model_id,
-            "model_revision": getattr(engine.model.config, "_commit_hash", None),
+            "model_revision": runtime.get("model_revision"),
             "dataset_sha256": dataset_hash(cases),
             "cases": len(cases),
             "repeats": repeats,
             "warmup_runs_per_method": 2,
-            "gpu": properties.name,
-            "gpu_total_mib": properties.total_memory / 2**20,
-            "dtype": str(engine.model.dtype),
+            "gpu": properties.get("name"),
+            "gpu_total_mib": None if total_memory is None else total_memory / 2**20,
+            "dtype": runtime.get("dtype"),
             "python": platform.python_version(),
             "versions": {name: version(name) for name in ("torch", "transformers", "accelerate")},
-            "cuda": engine.torch.version.cuda,
+            "cuda": runtime.get("cuda"),
             "max_input_tokens": engine.max_input_tokens,
-            "timing": "tokenization + model + decode/normalization; CUDA synchronized; no HTTP",
+            "backend": runtime.get("backend"),
+            "backend_version": runtime.get("backend_version"),
+            "quantization": runtime.get("quantization"),
+            "runtime": runtime,
+            "memory_measurement": (
+                "torch_cuda_allocator"
+                if runtime.get("backend") == "transformers"
+                else "unavailable"
+            ),
+            "timing": "tokenization + model + decode/normalization; GPU synchronized; no HTTP",
             "memory": "PyTorch CUDA allocator only; weights included; MiB = 2^20 bytes",
             "generation_limits": {"generate_label": 16, "generate_json": 64},
             "method_order": "rotated by case and repeat",

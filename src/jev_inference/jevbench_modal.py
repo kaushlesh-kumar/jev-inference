@@ -7,7 +7,7 @@ from pathlib import Path
 
 import modal
 
-from .modal_app import cache, image, model_id, secret_name
+from .modal_app import backend, backend_options, cache, image, model_id, secret_name
 
 app = modal.App("jev-inference-public-benchmark")
 
@@ -31,7 +31,9 @@ def evaluate(
     from jev_inference.engine import DecisionEngine
     from jev_inference.jevbench_runner import run_jevbench
 
-    engine = DecisionEngine(model, "cuda", max_input_tokens, dtype)
+    engine = DecisionEngine(
+        model, "cuda", max_input_tokens, dtype, backend=backend, **backend_options()
+    )
     cache.commit()
     identity = hashlib.sha256(
         json.dumps([model, source, repeats, permutations, max_input_tokens, dtype]).encode()

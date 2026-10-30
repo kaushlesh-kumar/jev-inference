@@ -54,14 +54,20 @@ prompt lists all options. Labels and sequence likelihood can depend on option or
 Requests accept 2–26 unique, nonempty options. Label and Yes/No scoring require
 single-token labels. Sequence likelihood supports multi-token options without
 that requirement. Inputs exceeding the context limit fail instead of being truncated.
-Remote model code is disabled. Models must fit available memory; quantization,
-GGUF, encoder-only and multimodal models are outside the current implementation.
+Remote model code is disabled. Models must fit available memory. Transformers models
+run in their native dtype; quantized GGUF files run through the optional llama.cpp
+backend. Encoder-only and multimodal models are outside the current implementation.
 
 ## Local execution
 
 ```bash
 pip install -e '.[inference]'
 python run.py --model Qwen/Qwen2.5-1.5B-Instruct --device auto
+
+# Quantized GGUF through llama.cpp (all layers on the GPU)
+pip install -e '.[inference,llamacpp]'
+python run.py --backend llama_cpp --model .cache/gguf/qwen2.5-1.5b-instruct-q5_k_m.gguf \
+  --n-gpu-layers -1 --n-threads 8 --max-input-tokens 8192
 ```
 
 The API listens on `http://127.0.0.1:8000`. Options include `--device cpu|cuda|mps`,
@@ -69,6 +75,10 @@ The API listens on `http://127.0.0.1:8000`. Options include `--device cpu|cuda|m
 authentication. Serving and benchmark runners accept
 `--dtype auto|float16|bfloat16|float32`; `auto` uses the model's configured dtype.
 T4 supports native FP16 Tensor Cores, so the Modal example explicitly selects FP16.
+For GGUF runs, pass `--backend llama_cpp`, `--n-gpu-layers` (`-1` offloads all layers),
+and optionally `--n-threads`, `--n-batch` and `--chat-template`. `--dtype` and
+`--device` are ignored by llama.cpp. CUDA allocator memory is reported for Transformers;
+llama.cpp memory appears as `N/A`.
 
 ## Benchmarks
 
@@ -82,7 +92,13 @@ This is a public-subset experiment, not an official JevBench leaderboard score.
 python run_jevbench.py --modal --model Qwen/Qwen2.5-0.5B-Instruct --dtype float16 --output docs/jevbench-results-qwen2.5-0.5b.json
 python run_jevbench.py --modal --model Qwen/Qwen2.5-1.5B-Instruct --dtype float16 --output docs/jevbench-results-qwen2.5-1.5b.json
 python -m jev_inference.jevbench_report docs/jevbench-results-qwen2.5-0.5b.json docs/jevbench-results-qwen2.5-1.5b.json --readme
+python -m jev_inference.jevbench_compare docs/jevbench-results-qwen2.5-1.5b.json \
+  docs/jevbench-results-qwen2.5-1.5b-q5_k_m.json --output docs/jevbench-comparison-qwen2.5-1.5b.md
 ```
+
+To benchmark the GGUF model, pass `--backend llama_cpp --model PATH --n-gpu-layers -1`
+to `run_jevbench.py`. Compare accuracy, calibration and order sensitivity; latency
+deltas reflect the runtime and precision choice as well as the measuring hardware.
 
 For a local CUDA GPU, install `.[inference]` and omit `--modal`. Configure
 `--repeats`, `--permutations`, `--max-input-tokens` or `--limit` for diagnostic runs.
@@ -113,6 +129,8 @@ Test rig: Modal, Tesla T4, torch.float16, batch/concurrency 1, 8192-token contex
 Full rig configuration and tier breakdown: [docs/jevbench-report.md](docs/jevbench-report.md).
 Raw per-task measurements: [jevbench-results-qwen2.5-0.5b.json](docs/jevbench-results-qwen2.5-0.5b.json), [jevbench-results-qwen2.5-1.5b.json](docs/jevbench-results-qwen2.5-1.5b.json).
 <!-- jevbench-results:end -->
+
+GGUF comparison: [Qwen2.5-1.5B-Instruct Q5_K_M with llama.cpp](docs/jevbench-comparison-qwen2.5-1.5b.md).
 
 The earlier [30-task comparison](docs/benchmark-comparison.md) uses BF16 and three
 repeats per method. Its different dataset and protocol should be evaluated

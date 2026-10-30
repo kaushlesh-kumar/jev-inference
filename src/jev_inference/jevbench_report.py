@@ -89,14 +89,15 @@ def render(results):
         meta = result["metadata"]
         lines += [f"**{meta['model']}**", "", "```json", json.dumps(meta, indent=2), "```", ""]
     lines += [
-        "Timing includes tokenization, inference and processing with CUDA synchronization; "
-        "model loading, queueing and HTTP are excluded. Peak memory measures allocated PyTorch "
-        "tensors including model weights, excluding allocator cache and CUDA context. "
+        "Timing includes tokenization, inference and processing with backend synchronization; "
+        "model loading, queueing and HTTP are excluded. Peak memory measures the Transformers "
+        "PyTorch allocator when available, or N/A for llama.cpp; allocator cache and CUDA "
+        "context are excluded. "
         "Host-visible resources and GPU driver/clocks are snapshots, not pinned allocations. "
         "Each GPU job runs methods serially with batch size and concurrency one. "
-        "Generation uses KV cache; scoring disables it. No quantization, torch.compile, "
-        "TensorRT or vLLM is enabled. Different model jobs may overlap on separate "
-        "Modal GPU allocations.",
+        "Generation uses KV cache; scoring disables it. No runtime quantization, torch.compile, "
+        "TensorRT or vLLM is enabled. GGUF weights may use their storage quantization. Different "
+        "model jobs may overlap on separate Modal GPU allocations.",
         "",
         "### Task breakdown",
         "",
